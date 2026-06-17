@@ -10,6 +10,9 @@ from email_verifier.export_utils import (
     dataframe_to_csv_bytes,
     dataframe_to_pdf_bytes,
     dataframe_to_xlsx_bytes,
+    dataframe_valid_xlsx_bytes,
+    dataframe_risky_xlsx_bytes,
+    dataframe_invalid_xlsx_bytes,
 )
 from email_verifier.io import (
     ColumnMapping,
@@ -305,8 +308,8 @@ def render_bulk_verification() -> None:
 
     styled_df = result_df.style.applymap(highlight_status, subset=[
         "Overall Status", "Format", "Professional Domain",
-        "Domain Status", "Mailbox", "Disposable Email",
-        "Role Account", "First Name", "Last Name",
+        "Domain Status", "Mailbox Status", "Disposable",
+        "Role Account", "MX Record", "First Name", "Last Name",
     ])
 
     st.dataframe(styled_df, width="stretch", hide_index=True)
@@ -314,10 +317,10 @@ def render_bulk_verification() -> None:
     st.markdown("---")
     st.markdown("### Per-Email Detailed View")
 
-    email_list = result_df["Email"].tolist()
+    email_list = result_df["Email Address"].tolist()
     selected_email = st.selectbox("Select an email to view details", options=email_list)
     if selected_email:
-        row = result_df[result_df["Email"] == selected_email].iloc[0]
+        row = result_df[result_df["Email Address"] == selected_email].iloc[0]
         overall = str(row.get("Overall Status", ""))
 
         if overall == "VALID":
@@ -333,11 +336,12 @@ def render_bulk_verification() -> None:
             ("Format", "Format", "green" if str(row.get("Format")) == "Valid" else "red"),
             ("Domain Status", "Domain Status", "green" if str(row.get("Domain Status")) == "Valid" else "red"),
             ("Professional Domain", "Professional Domain", "green" if str(row.get("Professional Domain")) == "Valid" else "red"),
-            ("Disposable Email", "Disposable Email", "red" if str(row.get("Disposable Email")) == "Yes" else "green"),
+            ("Disposable", "Disposable", "red" if str(row.get("Disposable")) == "Yes" else "green"),
             ("Role Account", "Role Account", "red" if str(row.get("Role Account")) == "Yes" else "green"),
-            ("Mailbox", "Mailbox", "green" if str(row.get("Mailbox")) == "Valid" else "red"),
+            ("MX Record", "MX Record", "green" if str(row.get("MX Record")) == "Valid" else "red"),
+            ("Mailbox Status", "Mailbox Status", "green" if str(row.get("Mailbox Status")) == "Exists" else "red"),
             ("Catch-All", "Catch-All", "orange" if str(row.get("Catch-All")) == "Yes" else "green"),
-            ("Provider Type", "Provider Type", "green" if str(row.get("Provider Type")) == "Business" else "orange"),
+            ("Company Website", "Company Website", "green" if str(row.get("Company Website")) != "Not Found" else "orange"),
         ]
 
         for label, key, color in detail_items:
@@ -350,57 +354,100 @@ def render_bulk_verification() -> None:
             )
 
         st.markdown("")
-        score_val = str(row.get("Verification Score", ""))
-        result_val = str(row.get("Result", ""))
+        score_val = int(row.get("Email Score", 0))
         date_val = str(row.get("Verification Date", ""))
-        time_val = str(row.get("Verification Time", ""))
+        smtp_val = str(row.get("SMTP Response", ""))
 
-        col_sc, col_re, col_dt = st.columns(3)
+        col_sc, col_sm, col_dt = st.columns(3)
         with col_sc:
-            st.markdown(f"**Score:** {score_val}")
-        with col_re:
-            result_icon = {"Deliverable": "🟢", "Risky": "🟡", "Undeliverable": "🔴"}
-            st.markdown(f"**Result:** {result_icon.get(result_val, '')} {result_val}")
+            score_color = "green" if score_val >= 70 else ("orange" if score_val >= 40 else "red")
+            st.markdown(f"**Score:** <span style='color:{score_color}'>{score_val}/100</span>", unsafe_allow_html=True)
+        with col_sm:
+            st.markdown(f"**SMTP Response:** {smtp_val[:50]}")
         with col_dt:
-            st.markdown(f"**Date:** {date_val} {time_val}")
+            st.markdown(f"**Date:** {date_val}")
 
     st.markdown("---")
     st.markdown("### Export Options")
-
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base_name = f"email_verification_results_{timestamp}"
+    base = f"email_verification_report_{timestamp}"
 
-    export_cols = st.columns(3)
-    with export_cols[0]:
-        csv_data = dataframe_to_csv_bytes(result_df)
-        st.download_button(
-            "📥 Download CSV",
-            data=csv_data,
-            file_name=f"{base_name}.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-    with export_cols[1]:
-        xlsx_data = dataframe_to_xlsx_bytes(result_df)
-        st.download_button(
-            "📥 Download Excel (XLSX)",
-            data=xlsx_data,
-            file_name=f"{base_name}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
-    with export_cols[2]:
-        try:
-            pdf_data = dataframe_to_pdf_bytes(result_df)
+    exp_tabs = st.tabs(["📥 Full Report", "📥 Filtered Exports"])
+
+    with exp_tabs[0]:
+        ec1, ec2, ec3 = st.columns(3)
+        with ec1:
+            csv_data = dataframe_to_csv_bytes(result_df)
             st.download_button(
-                "📥 Download PDF Report",
-                data=pdf_data,
-                file_name=f"{base_name}.pdf",
-                mime="application/pdf",
+                "📄 Download CSV",
+                data=csv_data,
+                file_name=f"{base}.csv",
+                mime="text/csv",
                 use_container_width=True,
             )
-        except Exception as exc:
-            st.error(f"PDF generation failed: {exc}")
+        with ec2:
+            xlsx_data = dataframe_to_xlsx_bytes(result_df)
+            st.download_button(
+                "📗 Download Full Report (XLSX)",
+                data=xlsx_data,
+                file_name=f"{base}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+        with ec3:
+            try:
+                pdf_data = dataframe_to_pdf_bytes(result_df)
+                st.download_button(
+                    "📕 Download PDF Report",
+                    data=pdf_data,
+                    file_name=f"{base}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
+            except Exception as exc:
+                st.error(f"PDF failed: {exc}")
+
+    with exp_tabs[1]:
+        fe1, fe2, fe3 = st.columns(3)
+        has_valid = valid_count > 0
+        has_risky = risky_count > 0
+        has_invalid = invalid_count > 0
+        with fe1:
+            if has_valid:
+                vx = dataframe_valid_xlsx_bytes(result_df)
+                st.download_button(
+                    "🟢 Valid Emails (XLSX)",
+                    data=vx,
+                    file_name=f"Valid_Emails_{timestamp}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            else:
+                st.button("🟢 Valid Emails", disabled=True, use_container_width=True)
+        with fe2:
+            if has_risky:
+                rx = dataframe_risky_xlsx_bytes(result_df)
+                st.download_button(
+                    "🟡 Risky Emails (XLSX)",
+                    data=rx,
+                    file_name=f"Risky_Emails_{timestamp}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            else:
+                st.button("🟡 Risky Emails", disabled=True, use_container_width=True)
+        with fe3:
+            if has_invalid:
+                ix = dataframe_invalid_xlsx_bytes(result_df)
+                st.download_button(
+                    "🔴 Invalid Emails (XLSX)",
+                    data=ix,
+                    file_name=f"Invalid_Emails_{timestamp}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            else:
+                st.button("🔴 Invalid Emails", disabled=True, use_container_width=True)
 
 
 def render_app() -> None:

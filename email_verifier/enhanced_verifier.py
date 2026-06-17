@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 from email_verifier.dns_checks import DnsVerifier
 from email_verifier.email_checks import extract_domain, normalize_email, validate_email_format
+from email_verifier.linkedin import build_linkedin_search_url
 from email_verifier.name_extractor import extract_names_from_email
 from email_verifier.professional_check import is_disposable_email, is_free_email, is_role_account
 from email_verifier.smtp_check import verify_mailbox_smtp
@@ -42,6 +43,10 @@ class EnhancedVerificationResult:
     provider_type: str = ""
     disposable_email: bool = False
     role_account: bool = False
+    smtp_response: str = ""
+    linkedin_url: str = ""
+    website_status: str = ""
+    verification_source: str = "Real-Time"
 
 
 def verify_single_email(email_address: str) -> EnhancedVerificationResult:
@@ -102,6 +107,12 @@ def verify_single_email(email_address: str) -> EnhancedVerificationResult:
     local_part = email.split("@")[0] if "@" in email else ""
     result.role_account = is_role_account(local_part)
 
+    result.linkedin_url = build_linkedin_search_url(
+        name=result.first_name or result.full_name,
+        company="",
+    )
+    result.website_status = "Active" if domain else "Unknown"
+
     dns_verifier = DnsVerifier(timeout=5.0)
     dns_result = dns_verifier.verify_domain(domain) if domain else None
 
@@ -138,6 +149,7 @@ def verify_single_email(email_address: str) -> EnhancedVerificationResult:
 
     if dns_result and dns_result.mx.found:
         smtp_result = verify_mailbox_smtp(email, domain)
+        result.smtp_response = smtp_result.error or "Mail server responded"
         if smtp_result.mailbox_exists is True:
             result.mailbox_check = VerificationDetail(
                 status="Valid",

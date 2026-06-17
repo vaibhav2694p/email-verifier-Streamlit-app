@@ -68,7 +68,7 @@ def render_app() -> None:
             index=get_default_column_index(columns, company_guess),
         )
 
-    st.dataframe(dataframe.head(25), use_container_width=True, hide_index=True)
+    st.dataframe(dataframe.head(25), width='stretch', hide_index=True)
 
     if not email_column:
         st.error("Select an email column before verification.")
@@ -111,7 +111,7 @@ def render_app() -> None:
 
     status_text.write(f"Verified {len(result)} rows")
     st.success("Verification complete.")
-    st.dataframe(result, use_container_width=True, hide_index=True)
+    st.dataframe(result, width='stretch', hide_index=True)
 
     csv_bytes = result.to_csv(index=False).encode("utf-8")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

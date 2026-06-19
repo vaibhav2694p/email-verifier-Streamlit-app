@@ -1,19 +1,18 @@
 from __future__ import annotations
 
 import re
-from io import BytesIO
 from pathlib import Path
 
 import dns.resolver
-import pandas as pd
-import streamlit as st
+from email_validator import validate_email as ev_validate, EmailSyntaxError
 
-ROLE_PREFIXES = (
+ROLE_PREFIXES = frozenset({
     "info", "sales", "support", "admin", "contact",
     "hello", "marketing", "hr", "careers", "billing",
     "team", "help", "enquiries", "enquiry", "office",
     "noreply", "no-reply", "newsletter", "jobs",
-)
+    "feedback", "test", "mail", "service", "events",
+})
 
 _PUBLIC_DOMAINS: frozenset[str] = frozenset({
     "gmail.com", "yahoo.com", "outlook.com", "hotmail.com",
@@ -24,6 +23,44 @@ _PUBLIC_DOMAINS: frozenset[str] = frozenset({
     "rediffmail.com", "qq.com", "naver.com", "daum.net",
     "163.com", "126.com", "sina.com", "sohu.com",
 })
+
+_EMAIL_PROVIDERS: dict[str, str] = {
+    "gmail.com": "Google",
+    "yahoo.com": "Yahoo",
+    "ymail.com": "Yahoo",
+    "outlook.com": "Microsoft",
+    "hotmail.com": "Microsoft",
+    "live.com": "Microsoft",
+    "msn.com": "Microsoft",
+    "aol.com": "AOL",
+    "icloud.com": "Apple",
+    "proton.me": "ProtonMail",
+    "protonmail.com": "ProtonMail",
+    "mail.com": "mail.com",
+    "zoho.com": "Zoho",
+    "yandex.com": "Yandex",
+    "gmx.com": "GMX",
+    "gmx.net": "GMX",
+    "fastmail.com": "Fastmail",
+    "tutanota.com": "Tutanota",
+    "tutamail.com": "Tutanota",
+    "rediffmail.com": "Rediffmail",
+    "qq.com": "QQ Mail",
+    "naver.com": "Naver",
+    "daum.net": "Daum",
+    "163.com": "163 Mail",
+    "126.com": "126 Mail",
+    "sina.com": "Sina Mail",
+    "sohu.com": "Sohu Mail",
+    "gmx.de": "GMX",
+    "gmx.ch": "GMX",
+    "gmx.at": "GMX",
+    "mail.ru": "Mail.ru",
+    "bk.ru": "Mail.ru",
+    "list.ru": "Mail.ru",
+    "inbox.ru": "Mail.ru",
+    "facebook.com": "Facebook",
+}
 
 _DISPOSABLE_DOMAINS: set[str] | None = None
 
@@ -42,8 +79,8 @@ def _load_disposable_domains() -> set[str]:
     return _DISPOSABLE_DOMAINS
 
 
-def clean_domain(value: str) -> str:
-    if pd.isna(value):
+def clean_domain(value: str | None) -> str:
+    if value is None or value == "" or (isinstance(value, float) and str(value) == "nan"):
         return ""
     domain = str(value).strip().lower()
     domain = re.sub(r"^https?://", "", domain)
@@ -56,20 +93,23 @@ def clean_domain(value: str) -> str:
     return domain
 
 
-def extract_email_domain(email: str) -> str:
-    email = str(email).strip()
-    if "@" in email:
-        return email.split("@", 1)[1].strip().lower()
-    return ""
+def normalize_email(email: str) -> tuple[str, str, str]:
+    try:
+        result = ev_validate(email, check_deliverability=False)
+        return result.normalized, result.local_part, result.domain
+    except EmailSyntaxError:
+        return email.strip(), "", ""
 
 
-def is_valid_email(email: str) -> bool:
-    email = str(email).strip()
-    pattern = r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$"
-    return bool(re.match(pattern, email))
+def is_valid_email_syntax(email: str) -> bool:
+    try:
+        ev_validate(email, check_deliverability=False)
+        return True
+    except EmailSyntaxError:
+        return False
 
 
-def lookup_mx_records(domain: str) -> tuple[bool, str]:
+def lookup_mx(domain: str) -> tuple[bool, str]:
     if not domain:
         return False, "No domain provided"
     try:
@@ -92,262 +132,165 @@ def lookup_mx_records(domain: str) -> tuple[bool, str]:
         return False, f"Lookup failed: {e}"
 
 
-def check_spf(domain: str) -> bool:
-    if not domain:
-        return False
-    try:
-        answers = dns.resolver.resolve(domain, "TXT", lifetime=5)
-        for r in answers:
-            txt = str(r).lower()
-            if "v=spf1" in txt:
-                return True
-    except Exception:
-        pass
-    return False
+def detect_provider(domain: str) -> str:
+    return _EMAIL_PROVIDERS.get(domain.strip().lower(), "Unknown")
 
 
-def check_dmarc(domain: str) -> bool:
-    if not domain:
-        return False
-    try:
-        dmarc_domain = f"_dmarc.{domain}"
-        answers = dns.resolver.resolve(dmarc_domain, "TXT", lifetime=5)
-        for r in answers:
-            txt = str(r).lower()
-            if "v=dmarc1" in txt:
-                return True
-    except Exception:
-        pass
-    return False
-
-
-def is_public_email_domain(domain: str) -> bool:
+def is_public_domain(domain: str) -> bool:
     return domain.strip().lower() in _PUBLIC_DOMAINS
 
 
 def is_disposable_domain(domain: str) -> bool:
-    disposables = _load_disposable_domains()
-    return domain.strip().lower() in disposables
+    return domain.strip().lower() in _load_disposable_domains()
 
 
-def is_role_based_email(email: str) -> bool:
+def is_role_based(email: str) -> bool:
     local = str(email).split("@", 1)[0].strip().lower() if "@" in email else ""
     local = re.sub(r"[^a-zA-Z0-9]", "", local)
     return local in ROLE_PREFIXES
 
 
-def calculate_verification_score(result: dict) -> tuple[int, str, str]:
-    if not result.get("syntax_valid", False):
-        return 0, "Invalid", "Invalid email syntax"
+def _determine_status(score: int, flags: dict) -> str:
+    if not flags.get("syntax_valid"):
+        return "Invalid"
+    if flags.get("is_disposable"):
+        return "Disposable"
+    if not flags.get("mx_found"):
+        return "No MX"
+    if flags.get("is_public_email"):
+        return "Public Email"
+    if flags.get("is_role_based"):
+        return "Risky"
+    if flags.get("company_domain_match") is False:
+        return "Company Domain Mismatch"
+    if score >= 80:
+        return "Verified"
+    if score >= 50:
+        return "Risky"
+    return "Invalid"
 
-    if result.get("is_disposable", False):
-        return 10, "Disposable", "Disposable email domain"
 
-    score = 10
-    notes = []
+def _compute_score(flags: dict) -> int:
+    if not flags.get("syntax_valid"):
+        return 0
+    if flags.get("is_disposable"):
+        return min(10, 10)
 
-    if result.get("mx_found", False):
-        score += 20
-    else:
-        return min(score, 20), "No MX Found", "Domain has no MX records"
-
-    if result.get("spf_found", False):
-        score += 10
-    else:
-        notes.append("SPF missing")
-
-    if result.get("dmarc_found", False):
-        score += 10
-    else:
-        notes.append("DMARC missing")
-
-    if result.get("company_domain_match") is True:
+    score = 0
+    if flags.get("mx_found"):
         score += 30
-    elif result.get("company_domain_match") is False:
-        score = min(score, 50)
-        notes.append("Email domain does not match company domain")
-
-    if not result.get("is_public_email", False):
-        score += 10
+        if flags.get("spf_found"):
+            score += 10
+        if flags.get("dmarc_found"):
+            score += 10
     else:
+        score = min(score, 20)
+
+    if flags.get("is_public_email"):
         score = min(score, 45)
-        notes.append("Public/free email provider")
 
-    if not result.get("is_disposable", False):
-        score += 10
+    if flags.get("company_domain_match") is True:
+        score += 30
+    elif flags.get("company_domain_match") is False:
+        score = min(score, 50)
 
-    if result.get("is_role_based", False):
-        score -= 10
-        notes.append("Role-based email")
+    if flags.get("is_role_based"):
+        score = max(0, score - 10)
 
-    score = max(0, min(score, 100))
-
-    if result.get("is_public_email", False):
-        status = "Public Email"
-    elif result.get("company_domain_match") is False:
-        status = "Company Domain Mismatch"
-    elif score >= 80:
-        status = "Verified"
-    elif score >= 50:
-        status = "Risky"
-    else:
-        status = "Invalid"
-
-    return score, status, "; ".join(notes) or status
+    return max(0, min(score, 100))
 
 
-def verify_email_row(
-    email: str,
-    company_domain_input: str | None = None,
-) -> dict:
+def _build_notes(flags: dict, status: str) -> str:
+    parts = []
+    if not flags.get("syntax_valid"):
+        return "Invalid email format"
+    if flags.get("is_disposable"):
+        return "Disposable email domain"
+    if not flags.get("mx_found"):
+        parts.append("No MX records found")
+    if flags.get("is_public_email"):
+        parts.append("Public/free email provider")
+    if flags.get("is_role_based"):
+        parts.append("Role-based email account")
+    if flags.get("company_domain_match") is False:
+        parts.append("Email domain does not match company domain")
+    return "; ".join(parts) if parts else status
+
+
+def verify_email(email: str, company_domain: str | None = None) -> dict:
     email = str(email).strip()
-    email_domain = extract_email_domain(email)
-    syntax_valid = is_valid_email(email)
-    is_disposable = is_disposable_domain(email_domain) if email_domain else False
-    is_public = is_public_email_domain(email_domain) if email_domain else False
-    role_based = is_role_based_email(email) if email_domain else False
+    normalized, local_part, email_domain = normalize_email(email)
+    syntax_valid = bool(email_domain and local_part)
+    is_disp = is_disposable_domain(email_domain) if email_domain else False
+    is_pub = is_public_domain(email_domain) if email_domain else False
+    is_role = is_role_based(email) if email_domain else False
 
     mx_found = False
     mx_details = ""
     spf_found = False
     dmarc_found = False
 
-    if syntax_valid and email_domain and not is_disposable:
-        mx_found, mx_details = lookup_mx_records(email_domain)
+    if syntax_valid and email_domain and not is_disp:
+        mx_found, mx_details = lookup_mx(email_domain)
         if mx_found:
-            spf_found = check_spf(email_domain)
-            dmarc_found = check_dmarc(email_domain)
+            try:
+                answers = dns.resolver.resolve(email_domain, "TXT", lifetime=5)
+                for r in answers:
+                    txt = str(r).lower()
+                    if "v=spf1" in txt:
+                        spf_found = True
+                        break
+            except Exception:
+                pass
+            try:
+                dmarc_domain = f"_dmarc.{email_domain}"
+                answers = dns.resolver.resolve(dmarc_domain, "TXT", lifetime=5)
+                for r in answers:
+                    txt = str(r).lower()
+                    if "v=dmarc1" in txt:
+                        dmarc_found = True
+                        break
+            except Exception:
+                pass
 
-    company_domain_match: bool | None = None
-    if company_domain_input:
-        clean_company = clean_domain(company_domain_input)
+    company_match: bool | None = None
+    clean_company = ""
+    if company_domain:
+        clean_company = clean_domain(company_domain)
         if clean_company:
-            company_domain_match = email_domain == clean_company
+            company_match = email_domain == clean_company
 
-    result = {
-        "email": email,
-        "email_domain": email_domain,
+    flags = {
         "syntax_valid": syntax_valid,
         "mx_found": mx_found,
-        "mx_details": mx_details,
         "spf_found": spf_found,
         "dmarc_found": dmarc_found,
-        "is_public_email": is_public,
-        "is_disposable": is_disposable,
-        "is_role_based": role_based,
-        "company_domain_match": company_domain_match,
+        "is_public_email": is_pub,
+        "is_disposable": is_disp,
+        "is_role_based": is_role,
+        "company_domain_match": company_match,
     }
 
-    score, status, notes = calculate_verification_score(result)
-    result["score"] = score
-    result["status"] = status
-    result["notes"] = notes
+    score = _compute_score(flags)
+    status = _determine_status(score, flags)
+    notes = _build_notes(flags, status)
 
-    return result
-
-
-def render_domain_verification() -> None:
-    st.subheader("Domain & Email Verification")
-    st.write(
-        "Upload a CSV/XLSX file with email addresses. "
-        "Optionally provide a company domain column for company-domain matching."
-    )
-
-    uploaded_file = st.file_uploader(
-        "Upload Excel or CSV file", type=["xlsx", "csv"], key="domain_verifier"
-    )
-
-    if uploaded_file:
-        try:
-            if uploaded_file.name.endswith(".csv"):
-                df = pd.read_csv(uploaded_file, dtype=str, keep_default_na=False)
-            else:
-                df = pd.read_excel(uploaded_file, dtype=str, keep_default_na=False)
-
-            df = df.fillna("")
-
-            st.subheader("Uploaded Data Preview")
-            st.dataframe(df.head())
-
-            columns = list(df.columns)
-            email_col = st.selectbox("Select the email column", columns)
-            company_col = st.selectbox(
-                "Select the company domain column (optional)",
-                [""] + columns,
-                index=0,
-            )
-
-            if st.button("Verify Emails"):
-                total = len(df)
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-
-                results = []
-                for idx, row in df.iterrows():
-                    email = str(row.get(email_col, "")).strip()
-                    company_domain = (
-                        str(row.get(company_col, "")).strip()
-                        if company_col
-                        else None
-                    )
-                    status_text.text(
-                        f"Verifying {idx + 1} of {total}: {email or '(empty)'}"
-                    )
-                    result = verify_email_row(email, company_domain)
-
-                    results.append(
-                        {
-                            "Email": result["email"],
-                            "Email Domain": result["email_domain"],
-                            "Clean Company Domain": clean_domain(company_domain) if company_domain else "",
-                            "Syntax Valid": "Yes" if result["syntax_valid"] else "No",
-                            "MX Records": result["mx_details"] if result["mx_found"] else "Not Found",
-                            "SPF Found": "Yes" if result["spf_found"] else "No",
-                            "DMARC Found": "Yes" if result["dmarc_found"] else "No",
-                            "Public Email": "Yes" if result["is_public_email"] else "No",
-                            "Disposable Email": "Yes" if result["is_disposable"] else "No",
-                            "Role Based Email": "Yes" if result["is_role_based"] else "No",
-                            "Company Domain Match": (
-                                "Yes" if result["company_domain_match"] is True
-                                else "No" if result["company_domain_match"] is False
-                                else "N/A"
-                            ),
-                            "Verification Score": result["score"],
-                            "Verification Status": result["status"],
-                            "Notes": result["notes"],
-                        }
-                    )
-
-                    progress_bar.progress((idx + 1) / total)
-
-                result_df = pd.DataFrame(results)
-                status_text.success("Verification complete.")
-
-                st.subheader("Results")
-                st.dataframe(result_df, hide_index=True)
-
-                output = BytesIO()
-                with pd.ExcelWriter(output, engine="openpyxl") as writer:
-                    result_df.to_excel(writer, index=False, sheet_name="Verification Results")
-                excel_bytes = output.getvalue()
-
-                col_a, col_b = st.columns(2)
-                with col_a:
-                    st.download_button(
-                        "Download Excel",
-                        data=excel_bytes,
-                        file_name="email_verification_results.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
-                    )
-                with col_b:
-                    st.download_button(
-                        "Download CSV",
-                        data=result_df.to_csv(index=False).encode("utf-8"),
-                        file_name="email_verification_results.csv",
-                        mime="text/csv",
-                        use_container_width=True,
-                    )
-
-        except Exception as e:
-            st.error(f"File processing failed: {e}")
+    return {
+        "Original Email": email,
+        "Normalized Email": normalized,
+        "Email Domain": email_domain,
+        "Company Domain": clean_company,
+        "MX Status": "Found" if mx_found else "Not Found",
+        "Email Provider": detect_provider(email_domain) if email_domain else "Unknown",
+        "Public Email": "Yes" if is_pub else "No",
+        "Disposable Email": "Yes" if is_disp else "No",
+        "Role Based Email": "Yes" if is_role else "No",
+        "Company Domain Match": (
+            "Yes" if company_match is True
+            else "No" if company_match is False
+            else "N/A"
+        ),
+        "Verification Status": status,
+        "Verification Score": score,
+        "Notes": notes,
+    }

@@ -1,46 +1,36 @@
 from __future__ import annotations
 
 import re
+import ssl
+import socket
 from pathlib import Path
+from urllib.parse import urlparse
 
 import dns.resolver
+import requests
 from email_validator import validate_email as ev_validate, EmailSyntaxError
 
-ROLE_PREFIXES = frozenset({
-    "info", "sales", "support", "admin", "contact",
-    "hello", "marketing", "hr", "careers", "billing",
-    "team", "help", "enquiries", "enquiry", "office",
-    "noreply", "no-reply", "newsletter", "jobs",
-    "feedback", "test", "mail", "service", "events",
-})
-
-_PUBLIC_DOMAINS: frozenset[str] = frozenset({
-    "gmail.com", "yahoo.com", "outlook.com", "hotmail.com",
-    "aol.com", "icloud.com", "proton.me", "protonmail.com",
-    "live.com", "msn.com", "ymail.com", "mail.com",
-    "zoho.com", "yandex.com", "gmx.com", "gmx.net",
-    "fastmail.com", "tutanota.com", "tutamail.com",
-    "rediffmail.com", "qq.com", "naver.com", "daum.net",
-    "163.com", "126.com", "sina.com", "sohu.com",
-})
-
 _EMAIL_PROVIDERS: dict[str, str] = {
-    "gmail.com": "Google",
-    "yahoo.com": "Yahoo",
-    "ymail.com": "Yahoo",
-    "outlook.com": "Microsoft",
-    "hotmail.com": "Microsoft",
-    "live.com": "Microsoft",
-    "msn.com": "Microsoft",
-    "aol.com": "AOL",
-    "icloud.com": "Apple",
-    "proton.me": "ProtonMail",
-    "protonmail.com": "ProtonMail",
+    "gmail.com": "Google Workspace",
+    "googlemail.com": "Google Workspace",
+    "yahoo.com": "Yahoo Mail",
+    "ymail.com": "Yahoo Mail",
+    "outlook.com": "Microsoft 365",
+    "hotmail.com": "Microsoft 365",
+    "live.com": "Microsoft 365",
+    "msn.com": "Microsoft 365",
+    "aol.com": "AOL Mail",
+    "icloud.com": "Apple iCloud",
+    "proton.me": "Proton Mail",
+    "protonmail.com": "Proton Mail",
     "mail.com": "mail.com",
-    "zoho.com": "Zoho",
-    "yandex.com": "Yandex",
+    "zoho.com": "Zoho Mail",
+    "yandex.com": "Yandex Mail",
     "gmx.com": "GMX",
     "gmx.net": "GMX",
+    "gmx.de": "GMX",
+    "gmx.ch": "GMX",
+    "gmx.at": "GMX",
     "fastmail.com": "Fastmail",
     "tutanota.com": "Tutanota",
     "tutamail.com": "Tutanota",
@@ -52,14 +42,21 @@ _EMAIL_PROVIDERS: dict[str, str] = {
     "126.com": "126 Mail",
     "sina.com": "Sina Mail",
     "sohu.com": "Sohu Mail",
-    "gmx.de": "GMX",
-    "gmx.ch": "GMX",
-    "gmx.at": "GMX",
     "mail.ru": "Mail.ru",
     "bk.ru": "Mail.ru",
     "list.ru": "Mail.ru",
     "inbox.ru": "Mail.ru",
     "facebook.com": "Facebook",
+    "amazon.com": "Amazon",
+    "apple.com": "Apple",
+    "microsoft.com": "Microsoft",
+    "github.com": "GitHub",
+    "gitlab.com": "GitLab",
+    "atlassian.com": "Atlassian",
+    "slack.com": "Slack",
+    "notion.so": "Notion",
+    "stripe.com": "Stripe",
+    "shopify.com": "Shopify",
 }
 
 _DISPOSABLE_DOMAINS: set[str] | None = None
@@ -79,26 +76,11 @@ def _load_disposable_domains() -> set[str]:
     return _DISPOSABLE_DOMAINS
 
 
-def clean_domain(value: str | None) -> str:
-    if value is None or value == "" or (isinstance(value, float) and str(value) == "nan"):
-        return ""
-    domain = str(value).strip().lower()
-    domain = re.sub(r"^https?://", "", domain)
-    domain = re.sub(r"^www\.", "", domain)
-    domain = domain.split("/")[0]
-    domain = domain.split(":")[0]
-    domain = domain.strip()
-    if not re.match(r"^[a-z0-9.-]+\.[a-z]{2,}$", domain):
-        return ""
-    return domain
-
-
-def normalize_email(email: str) -> tuple[str, str, str]:
-    try:
-        result = ev_validate(email, check_deliverability=False)
-        return result.normalized, result.local_part, result.domain
-    except EmailSyntaxError:
-        return email.strip(), "", ""
+def extract_domain(email: str) -> str:
+    email = str(email).strip().lower()
+    if "@" in email:
+        return email.split("@", 1)[1].strip()
+    return ""
 
 
 def is_valid_email_syntax(email: str) -> bool:
@@ -109,187 +91,196 @@ def is_valid_email_syntax(email: str) -> bool:
         return False
 
 
+def normalize_email(email: str) -> str:
+    try:
+        result = ev_validate(email, check_deliverability=False)
+        return result.normalized
+    except EmailSyntaxError:
+        return email.strip().lower()
+
+
 def lookup_mx(domain: str) -> tuple[bool, str]:
     if not domain:
-        return False, "No domain provided"
+        return False, "No domain"
     try:
         answers = dns.resolver.resolve(domain, "MX", lifetime=5)
-        records = sorted(
-            [f"{r.preference} {str(r.exchange).rstrip('.')}" for r in answers]
-        )
+        records = sorted([f"{r.preference} {str(r.exchange).rstrip('.')}" for r in answers])
         if records:
             return True, ", ".join(records)
-        return False, "No MX records found"
+        return False, "No MX records"
     except dns.resolver.NXDOMAIN:
-        return False, "Domain does not exist"
+        return False, "NXDOMAIN"
     except dns.resolver.NoAnswer:
-        return False, "No MX records found"
+        return False, "No MX records"
     except dns.resolver.NoNameservers:
-        return False, "DNS error"
+        return False, "No nameservers"
     except dns.exception.Timeout:
         return False, "DNS timeout"
     except Exception as e:
-        return False, f"Lookup failed: {e}"
+        return False, f"Error: {e}"
 
 
 def detect_provider(domain: str) -> str:
-    return _EMAIL_PROVIDERS.get(domain.strip().lower(), "Unknown")
-
-
-def is_public_domain(domain: str) -> bool:
-    return domain.strip().lower() in _PUBLIC_DOMAINS
+    return _EMAIL_PROVIDERS.get(domain.strip().lower(), "Custom / Business")
 
 
 def is_disposable_domain(domain: str) -> bool:
     return domain.strip().lower() in _load_disposable_domains()
 
 
-def is_role_based(email: str) -> bool:
-    local = str(email).split("@", 1)[0].strip().lower() if "@" in email else ""
-    local = re.sub(r"[^a-zA-Z0-9]", "", local)
-    return local in ROLE_PREFIXES
+def check_domain_website(domain: str) -> dict:
+    if not domain:
+        return {
+            "website_url": "",
+            "status": "No Domain",
+            "http_code": 0,
+            "ssl_valid": False,
+        }
+
+    url = f"https://www.{domain}"
+    try:
+        resp = requests.get(url, timeout=8, allow_redirects=True, verify=True)
+        http_code = resp.status_code
+        ssl_valid = True
+        status = "Active" if 200 <= http_code < 400 else "Inactive"
+    except requests.exceptions.SSLError:
+        try:
+            resp = requests.get(url.replace("https://", "http://"), timeout=8, allow_redirects=True, verify=False)
+            http_code = resp.status_code
+            ssl_valid = False
+            status = "Active (No SSL)" if 200 <= http_code < 400 else "Inactive"
+        except Exception:
+            return {
+                "website_url": url,
+                "status": "Unreachable",
+                "http_code": 0,
+                "ssl_valid": False,
+            }
+    except requests.exceptions.Timeout:
+        return {
+            "website_url": url,
+            "status": "Timeout",
+            "http_code": 0,
+            "ssl_valid": False,
+        }
+    except requests.exceptions.ConnectionError:
+        return {
+            "website_url": url,
+            "status": "Unreachable",
+            "http_code": 0,
+            "ssl_valid": False,
+        }
+    except Exception as e:
+        return {
+            "website_url": url,
+            "status": f"Error: {type(e).__name__}",
+            "http_code": 0,
+            "ssl_valid": False,
+        }
+
+    return {
+        "website_url": resp.url if 'resp' in locals() else url,
+        "status": status,
+        "http_code": http_code,
+        "ssl_valid": ssl_valid,
+    }
 
 
-def _determine_status(score: int, flags: dict) -> str:
-    if not flags.get("syntax_valid"):
-        return "Invalid"
-    if flags.get("is_disposable"):
-        return "Disposable"
-    if not flags.get("mx_found"):
-        return "No MX"
-    if flags.get("is_public_email"):
-        return "Public Email"
-    if flags.get("is_role_based"):
-        return "Risky"
-    if flags.get("company_domain_match") is False:
-        return "Company Domain Mismatch"
-    if score >= 80:
-        return "Verified"
-    if score >= 50:
-        return "Risky"
-    return "Invalid"
+def check_domain_active(domain: str) -> tuple[bool, str]:
+    """Check if domain resolves and has DNS records."""
+    if not domain:
+        return False, "No domain"
+    try:
+        dns.resolver.resolve(domain, "A", lifetime=3)
+        return True, "Resolves"
+    except dns.resolver.NXDOMAIN:
+        return False, "NXDOMAIN"
+    except dns.resolver.NoAnswer:
+        return False, "No A record"
+    except dns.exception.Timeout:
+        return False, "Timeout"
+    except Exception:
+        return False, "DNS error"
 
 
-def _compute_score(flags: dict) -> int:
-    if not flags.get("syntax_valid"):
-        return 0
-    if flags.get("is_disposable"):
-        return min(10, 10)
+def calculate_score(flags: dict) -> tuple[int, str, str]:
+    syntax_valid = flags.get("syntax_valid", False)
+    domain_active = flags.get("domain_active", False)
+    website_active = flags.get("website_active", False)
+    mx_found = flags.get("mx_found", False)
+    is_disposable = flags.get("is_disposable", False)
+
+    if not syntax_valid:
+        return 0, "Invalid", "Invalid email syntax"
+
+    if is_disposable:
+        return 10, "Invalid", "Disposable email domain"
 
     score = 0
-    if flags.get("mx_found"):
-        score += 30
-        if flags.get("spf_found"):
-            score += 10
-        if flags.get("dmarc_found"):
-            score += 10
+    notes = []
+
+    if domain_active:
+        score += 25
     else:
-        score = min(score, 20)
+        notes.append("Domain not active")
 
-    if flags.get("is_public_email"):
-        score = min(score, 45)
+    if website_active:
+        score += 25
+    else:
+        notes.append("Website not accessible")
 
-    if flags.get("company_domain_match") is True:
-        score += 30
-    elif flags.get("company_domain_match") is False:
-        score = min(score, 50)
+    if mx_found:
+        score += 35
+    else:
+        notes.append("No MX records")
 
-    if flags.get("is_role_based"):
-        score = max(0, score - 10)
+    score += 15
 
-    return max(0, min(score, 100))
+    score = max(0, min(score, 100))
 
+    if score >= 80:
+        status = "Verified"
+    elif score >= 50:
+        status = "Risky"
+    else:
+        status = "Invalid"
 
-def _build_notes(flags: dict, status: str) -> str:
-    parts = []
-    if not flags.get("syntax_valid"):
-        return "Invalid email format"
-    if flags.get("is_disposable"):
-        return "Disposable email domain"
-    if not flags.get("mx_found"):
-        parts.append("No MX records found")
-    if flags.get("is_public_email"):
-        parts.append("Public/free email provider")
-    if flags.get("is_role_based"):
-        parts.append("Role-based email account")
-    if flags.get("company_domain_match") is False:
-        parts.append("Email domain does not match company domain")
-    return "; ".join(parts) if parts else status
+    note_str = "; ".join(notes) if notes else status
+    return score, status, note_str
 
 
-def verify_email(email: str, company_domain: str | None = None) -> dict:
+def verify_email(email: str) -> dict:
     email = str(email).strip()
-    normalized, local_part, email_domain = normalize_email(email)
-    syntax_valid = bool(email_domain and local_part)
-    is_disp = is_disposable_domain(email_domain) if email_domain else False
-    is_pub = is_public_domain(email_domain) if email_domain else False
-    is_role = is_role_based(email) if email_domain else False
+    normalized = normalize_email(email)
+    syntax_valid = is_valid_email_syntax(email)
+    domain = extract_domain(email)
 
-    mx_found = False
-    mx_details = ""
-    spf_found = False
-    dmarc_found = False
+    mx_found, mx_details = lookup_mx(domain) if domain else (False, "No domain")
+    provider = detect_provider(domain) if domain else "Unknown"
+    is_disposable = is_disposable_domain(domain) if domain else False
 
-    if syntax_valid and email_domain and not is_disp:
-        mx_found, mx_details = lookup_mx(email_domain)
-        if mx_found:
-            try:
-                answers = dns.resolver.resolve(email_domain, "TXT", lifetime=5)
-                for r in answers:
-                    txt = str(r).lower()
-                    if "v=spf1" in txt:
-                        spf_found = True
-                        break
-            except Exception:
-                pass
-            try:
-                dmarc_domain = f"_dmarc.{email_domain}"
-                answers = dns.resolver.resolve(dmarc_domain, "TXT", lifetime=5)
-                for r in answers:
-                    txt = str(r).lower()
-                    if "v=dmarc1" in txt:
-                        dmarc_found = True
-                        break
-            except Exception:
-                pass
-
-    company_match: bool | None = None
-    clean_company = ""
-    if company_domain:
-        clean_company = clean_domain(company_domain)
-        if clean_company:
-            company_match = email_domain == clean_company
+    domain_active, domain_status = check_domain_active(domain)
+    website_info = check_domain_website(domain)
+    website_active = website_info["status"] == "Active"
 
     flags = {
         "syntax_valid": syntax_valid,
+        "domain_active": domain_active,
+        "website_active": website_active,
         "mx_found": mx_found,
-        "spf_found": spf_found,
-        "dmarc_found": dmarc_found,
-        "is_public_email": is_pub,
-        "is_disposable": is_disp,
-        "is_role_based": is_role,
-        "company_domain_match": company_match,
+        "is_disposable": is_disposable,
     }
 
-    score = _compute_score(flags)
-    status = _determine_status(score, flags)
-    notes = _build_notes(flags, status)
+    score, status, notes = calculate_score(flags)
 
     return {
-        "Original Email": email,
+        "Email": email,
         "Normalized Email": normalized,
-        "Email Domain": email_domain,
-        "Company Domain": clean_company,
-        "MX Status": "Found" if mx_found else "Not Found",
-        "Email Provider": detect_provider(email_domain) if email_domain else "Unknown",
-        "Public Email": "Yes" if is_pub else "No",
-        "Disposable Email": "Yes" if is_disp else "No",
-        "Role Based Email": "Yes" if is_role else "No",
-        "Company Domain Match": (
-            "Yes" if company_match is True
-            else "No" if company_match is False
-            else "N/A"
-        ),
+        "Domain": domain,
+        "Domain Active": "Yes" if domain_active else "No",
+        "Website Status": website_info["status"],
+        "MX Status": "Found" if mx_found else mx_details,
+        "Email Provider": provider,
         "Verification Status": status,
         "Verification Score": score,
         "Notes": notes,
